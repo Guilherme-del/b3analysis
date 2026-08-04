@@ -44,7 +44,7 @@ ACOES = {
         "ITUB4.SA",   # Itau Unibanco (PN) — alto DY historico
         "BBDC4.SA",   # Bradesco (PN) — predileto do Barsi
         "SANB11.SA",  # Santander Brasil (Unit)
-        "BRSR6.SA",   # Banrisul (Unit)
+        "BRSR6.SA",   # Banrisul (PN classe B) — estatal do RS
         "ITSA4.SA",   # Itausa (PN)
         "BNBR3.SA",   # Banco do Nordeste (ON)
     ],
@@ -103,7 +103,8 @@ def _normalizar_index(series: pd.Series) -> pd.Series:
 def _dividendos_por_ano(t: yf.Ticker) -> pd.Series:
     """
     Soma de dividendos por ano-calendario. Series vazia se nao houver historico.
-    Cacheado no proprio Ticker para evitar refetch entre as metricas.
+    O yfinance cacheia o historico no objeto Ticker, entao ler t.dividends aqui
+    e de novo em _dy_ttm nao refaz o download.
     """
     try:
         hist = t.dividends
@@ -175,14 +176,20 @@ def _avaliar_qualidade(roe: float | None, payout: float | None, anos: int) -> li
     return flags
 
 
-# ── Coleta por tipo de ativo ─────────────────────────────────────────────────
+# ── Coleta ───────────────────────────────────────────────────────────────────
 
-def fetch_acao(ticker_symbol: str, setor: str) -> dict:
-    """Coleta metricas Barsi/Bazin para uma acao."""
+def fetch_ativo(ticker_symbol: str, setor: str, is_fii: bool = False) -> dict:
+    """
+    Coleta metricas Barsi/Bazin para um ativo.
+
+    Acao e FII compartilham todo o pipeline de dividendos; a diferenca e que
+    ROE/payout nao tem sentido contabil para FII (que e avaliado por P/VP),
+    entao ficam fora do filtro de qualidade nesse caso.
+    """
     base = {
         "ticker": ticker_symbol.replace(".SA", ""),
         "setor":  setor,
-        "tipo":   "acao",
+        "tipo":   "fii" if is_fii else "acao",
         "erro":   None,
     }
     try:
@@ -203,68 +210,21 @@ def fetch_acao(ticker_symbol: str, setor: str) -> dict:
         div_medio_5a = _media_dividendo_5a(por_ano)
         dy_ttm_pct   = _dy_ttm(t, preco)
         anos_div     = _anos_pagando(por_ano)
-
-        preco_teto  = (div_medio_5a / BAZIN_MINIMA) if div_medio_5a > 0 else None
-        teto_cdi    = (div_medio_5a / CDI_ATUAL)    if div_medio_5a > 0 else None
-        margem_pct  = ((preco_teto / preco - 1) * 100) if preco_teto else None
-        margem_cdi  = ((teto_cdi   / preco - 1) * 100) if teto_cdi   else None
-
-        payout = info.get("payoutRatio")
-        roe    = info.get("returnOnEquity")
-        pvp    = info.get("priceToBook")
-
-        base.update({
-            "nome":          (info.get("longName") or info.get("shortName") or "")[:42],
-            "preco":         round(preco, 2),
-            "div_medio_5a":  round(div_medio_5a, 4),
-            "dy_ttm_pct":    round(dy_ttm_pct, 2),
-            "preco_teto":    round(preco_teto, 2) if preco_teto else None,
-            "margem_pct":    round(margem_pct, 1) if margem_pct is not None else None,
-            "teto_cdi":      round(teto_cdi, 2) if teto_cdi else None,
-            "margem_cdi":    round(margem_cdi, 1) if margem_cdi is not None else None,
-            "anos_div":      anos_div,
-            "payout_pct":    round(payout * 100, 1) if payout is not None else None,
-            "roe_pct":       round(roe * 100, 1) if roe is not None else None,
-            "p_vp":          round(pvp, 2) if pvp else None,
-            "flags":         _avaliar_qualidade(roe, payout, anos_div),
-        })
-    except Exception as e:
-        base["erro"] = str(e)[:100]
-    return base
-
-
-def fetch_fii(ticker_symbol: str) -> dict:
-    """Coleta metricas de dividendo + P/VP para um FII."""
-    base = {
-        "ticker": ticker_symbol.replace(".SA", ""),
-        "setor":  "FII",
-        "tipo":   "fii",
-        "erro":   None,
-    }
-    try:
-        t    = yf.Ticker(ticker_symbol)
-        info = t.info or {}
-
-        preco = (
-            info.get("regularMarketPrice")
-            or info.get("previousClose")
-            or info.get("currentPrice")
-            or 0.0
-        )
-        if not preco:
-            base["erro"] = "sem preco de mercado"
-            return base
-
-        por_ano      = _dividendos_por_ano(t)
-        div_medio_5a = _media_dividendo_5a(por_ano)
-        dy_ttm_pct   = _dy_ttm(t, preco)
-        anos_div     = _anos_pagando(por_ano)
-        pvp          = info.get("priceToBook")
 
         preco_teto = (div_medio_5a / BAZIN_MINIMA) if div_medio_5a > 0 else None
         teto_cdi   = (div_medio_5a / CDI_ATUAL)    if div_medio_5a > 0 else None
         margem_pct = ((preco_teto / preco - 1) * 100) if preco_teto else None
         margem_cdi = ((teto_cdi   / preco - 1) * 100) if teto_cdi   else None
+
+        pvp    = info.get("priceToBook")
+        roe    = None if is_fii else info.get("returnOnEquity")
+        payout = None if is_fii else info.get("payoutRatio")
+
+        # payout 0% com dividendo sendo pago e dado quebrado do yfinance, nao
+        # payout real (visto em TAEE11: POUT 0% com DY 8%). Trata como ausente
+        # para nao passar pelo filtro de qualidade disfarcado de dado valido.
+        if payout == 0 and dy_ttm_pct > 0:
+            payout = None
 
         base.update({
             "nome":         (info.get("longName") or info.get("shortName") or "")[:42],
@@ -276,8 +236,10 @@ def fetch_fii(ticker_symbol: str) -> dict:
             "teto_cdi":     round(teto_cdi, 2) if teto_cdi else None,
             "margem_cdi":   round(margem_cdi, 1) if margem_cdi is not None else None,
             "anos_div":     anos_div,
+            "payout_pct":   round(payout * 100, 1) if payout is not None else None,
+            "roe_pct":      round(roe * 100, 1) if roe is not None else None,
             "p_vp":         round(pvp, 2) if pvp else None,
-            "flags":        _avaliar_qualidade(None, None, anos_div),
+            "flags":        _avaliar_qualidade(roe, payout, anos_div),
         })
     except Exception as e:
         base["erro"] = str(e)[:100]
@@ -305,15 +267,18 @@ def _status(margem: float | None, flags: list[str] | None) -> str:
     return "MUITO CARO"
 
 
+# N/D so quando o dado nao existe. Zero e informacao (DY 0.0% = nao pagou nos
+# ultimos 12m; 0a = nenhum ano completo com dividendo) e e exibido como numero.
+
 def _linha_acao(r: dict) -> str:
     preco_s  = f"R${r['preco']:>8.2f}"
     teto_s   = f"R${r['preco_teto']:>8.2f}" if r.get("preco_teto") else "       N/D"
     margem_s = f"{r['margem_pct']:>+7.1f}%" if r.get("margem_pct") is not None else "     N/D"
     mcdi_s   = f"{r['margem_cdi']:>+7.1f}%" if r.get("margem_cdi") is not None else "     N/D"
-    dy_s     = f"{r['dy_ttm_pct']:>5.1f}%" if r.get("dy_ttm_pct") else "   N/D"
-    anos_s   = f"{r['anos_div']:>2}a" if r.get("anos_div") else " -"
+    dy_s     = f"{r['dy_ttm_pct']:>5.1f}%" if r.get("dy_ttm_pct") is not None else "   N/D"
+    anos_s   = f"{r['anos_div']:>2}a" if r.get("anos_div") is not None else "  -"
     roe_s    = f"{r['roe_pct']:>6.1f}%" if r.get("roe_pct") is not None else "    N/D"
-    pout_s   = f"{r['payout_pct']:>5.0f}%" if r.get("payout_pct") is not None else "  N/D"
+    pout_s   = f"{r['payout_pct']:>5.0f}%" if r.get("payout_pct") is not None else "   N/D"
     st       = _status(r.get("margem_pct"), r.get("flags"))
     obs      = (" " + ",".join(r["flags"])) if r.get("flags") else ""
     return (
@@ -327,9 +292,9 @@ def _linha_fii(r: dict) -> str:
     teto_s   = f"R${r['preco_teto']:>8.2f}" if r.get("preco_teto") else "       N/D"
     margem_s = f"{r['margem_pct']:>+7.1f}%" if r.get("margem_pct") is not None else "     N/D"
     mcdi_s   = f"{r['margem_cdi']:>+7.1f}%" if r.get("margem_cdi") is not None else "     N/D"
-    dy_s     = f"{r['dy_ttm_pct']:>5.1f}%" if r.get("dy_ttm_pct") else "   N/D"
-    anos_s   = f"{r['anos_div']:>2}a" if r.get("anos_div") else " -"
-    pvp_s    = f"{r['p_vp']:>5.2f}" if r.get("p_vp") else "  N/D"
+    dy_s     = f"{r['dy_ttm_pct']:>5.1f}%" if r.get("dy_ttm_pct") is not None else "   N/D"
+    anos_s   = f"{r['anos_div']:>2}a" if r.get("anos_div") is not None else "  -"
+    pvp_s    = f"{r['p_vp']:>6.2f}" if r.get("p_vp") else "   N/D"
     st       = _status(r.get("margem_pct"), r.get("flags"))
     obs      = (" " + ",".join(r["flags"])) if r.get("flags") else ""
     return (
@@ -444,6 +409,7 @@ def formatar_relatorio(acoes: list[dict], fiis: list[dict]) -> str:
     linhas.append("              Se MARG CDI for negativa, o ativo rende menos que a renda fixa hoje.")
     linhas.append("  DIV       = anos-calendario completos com dividendo (ultimos 10a)")
     linhas.append("  P/VP      = preco / valor patrimonial por cota")
+    linhas.append("  POUT N/D  = payout ausente no yfinance, ou 0% com dividendo pago (dado quebrado)")
     linhas.append("")
     linhas.append("  Nota: o ano corrente e excluido da media — ano parcial subestima o teto.")
     linhas.append("─" * W)
@@ -454,8 +420,19 @@ def formatar_relatorio(acoes: list[dict], fiis: list[dict]) -> str:
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    so_acoes = "--so-acoes" in sys.argv
-    so_fiis  = "--so-fiis"  in sys.argv
+    args         = sys.argv[1:]
+    validos      = {"--so-acoes", "--so-fiis"}
+    desconhecidos = [a for a in args if a not in validos]
+    if desconhecidos:
+        print(f"Argumento(s) desconhecido(s): {' '.join(desconhecidos)}")
+        print("Uso: scanner_dividendos.py [--so-acoes | --so-fiis]")
+        sys.exit(1)
+
+    so_acoes = "--so-acoes" in args
+    so_fiis  = "--so-fiis"  in args
+    if so_acoes and so_fiis:
+        print("Erro: --so-acoes e --so-fiis sao mutuamente exclusivos (juntos nao sobra nada para coletar).")
+        sys.exit(1)
 
     ts_pasta  = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     pasta     = os.path.join(SCANS_DIR, f"scan_div_{ts_pasta}")
@@ -471,7 +448,7 @@ def main() -> None:
         for setor, tickers in ACOES.items():
             for ticker in tickers:
                 print(f"  {ticker:<12}", end=" ", flush=True)
-                r = fetch_acao(ticker, setor)
+                r = fetch_ativo(ticker, setor)
                 acoes_resultados.append(r)
                 if r.get("erro"):
                     print(f"ERRO: {r['erro']}")
@@ -492,7 +469,7 @@ def main() -> None:
         print(f"\nColetando {len(FIIS)} FIIs...")
         for ticker in FIIS:
             print(f"  {ticker:<12}", end=" ", flush=True)
-            r = fetch_fii(ticker)
+            r = fetch_ativo(ticker, "FII", is_fii=True)
             fiis_resultados.append(r)
             if r.get("erro"):
                 print(f"ERRO: {r['erro']}")
