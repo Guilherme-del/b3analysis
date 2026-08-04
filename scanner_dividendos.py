@@ -126,8 +126,11 @@ def _media_dividendo_5a(por_ano: pd.Series) -> float:
     if por_ano.empty:
         return 0.0
     ano_atual = pd.Timestamp.now().year
-    completos = por_ano[(por_ano.index >= ano_atual - 5) & (por_ano.index <= ano_atual - 1)]
-    return float(completos.mean()) if not completos.empty else 0.0
+    # reindex preenche anos sem pagamento com zero. Sem isso, quem interrompeu
+    # o dividendo tem a media calculada so sobre os anos bons — teto inflado
+    # exatamente para o caso que o metodo mais quer excluir.
+    completos = por_ano.reindex(range(ano_atual - 5, ano_atual), fill_value=0.0)
+    return float(completos.mean())
 
 
 def _anos_pagando(por_ano: pd.Series) -> int:
@@ -161,7 +164,9 @@ def _dy_ttm(t: yf.Ticker, preco: float) -> float:
         return 0.0
 
 
-def _avaliar_qualidade(roe: float | None, payout: float | None, anos: int) -> list[str]:
+def _avaliar_qualidade(
+    roe: float | None, payout: float | None, anos: int, pagou_ultimo_ano: bool = True
+) -> list[str]:
     """
     Filtro de consistencia Barsi — aplicado ANTES do preco.
     Retorna lista de flags; lista vazia = passou.
@@ -173,6 +178,10 @@ def _avaliar_qualidade(roe: float | None, payout: float | None, anos: int) -> li
         flags.append("PAYOUT>100%")
     if anos < 5:
         flags.append(f"SO {anos}a")
+    # Pagamento interrompido e eliminatorio: quem tem historico mas nao pagou
+    # no ultimo ano completo nao pode aparecer como oportunidade.
+    if anos > 0 and not pagou_ultimo_ano:
+        flags.append("SEM DIV ULT.ANO")
     return flags
 
 
@@ -226,6 +235,9 @@ def fetch_ativo(ticker_symbol: str, setor: str, is_fii: bool = False) -> dict:
         if payout == 0 and dy_ttm_pct > 0:
             payout = None
 
+        ano_anterior   = pd.Timestamp.now().year - 1
+        pagou_ult_ano  = bool(por_ano.get(ano_anterior, 0.0) > 0)
+
         base.update({
             "nome":         (info.get("longName") or info.get("shortName") or "")[:42],
             "preco":        round(preco, 2),
@@ -239,7 +251,7 @@ def fetch_ativo(ticker_symbol: str, setor: str, is_fii: bool = False) -> dict:
             "payout_pct":   round(payout * 100, 1) if payout is not None else None,
             "roe_pct":      round(roe * 100, 1) if roe is not None else None,
             "p_vp":         round(pvp, 2) if pvp else None,
-            "flags":        _avaliar_qualidade(roe, payout, anos_div),
+            "flags":        _avaliar_qualidade(roe, payout, anos_div, pagou_ult_ano),
         })
     except Exception as e:
         base["erro"] = str(e)[:100]
@@ -400,6 +412,7 @@ def formatar_relatorio(acoes: list[dict], fiis: list[dict]) -> str:
     linhas.append("    ROE<0        — prejuizo no patrimonio, nao sustenta dividendo")
     linhas.append("    PAYOUT>100%  — distribui mais do que lucra, insustentavel")
     linhas.append("    SO Na        — historico de dividendos menor que 5 anos completos")
+    linhas.append("    SEM DIV ULT.ANO — nao pagou dividendo no ultimo ano-calendario completo")
     linhas.append("")
     linhas.append("  DY        = dividendos dos ultimos 12 meses / preco atual (calculado do")
     linhas.append("              historico real — o campo dividendYield do yfinance e inconsistente)")
@@ -411,7 +424,11 @@ def formatar_relatorio(acoes: list[dict], fiis: list[dict]) -> str:
     linhas.append("  P/VP      = preco / valor patrimonial por cota")
     linhas.append("  POUT N/D  = payout ausente no yfinance, ou 0% com dividendo pago (dado quebrado)")
     linhas.append("")
-    linhas.append("  Nota: o ano corrente e excluido da media — ano parcial subestima o teto.")
+    linhas.append("  Nota: o ano corrente e excluido da media (ano parcial subestima o teto)")
+    linhas.append("        e anos sem pagamento dentro da janela contam como zero.")
+    linhas.append("  Atencao FIIs: o historico de proventos do yfinance costuma comecar em ~2022;")
+    linhas.append("        anos ausentes na fonte contam como zero, entao o teto de FII pode estar")
+    linhas.append("        SUBESTIMADO. O P/VP nao depende desse historico e serve de contraprova.")
     linhas.append("─" * W)
 
     return "\n".join(linhas)
