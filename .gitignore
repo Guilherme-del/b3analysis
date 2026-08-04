@@ -12,6 +12,9 @@ build/
 # Cache de dados (CSVs baixados pelo yfinance)
 dataflows/data_cache/
 
+# Resultados dos scans (snapshots de mercado — não são código)
+scans/
+
 # Preferências locais (não versionar — específico por usuário)
 .b3profile
 .claude/settings.local.json

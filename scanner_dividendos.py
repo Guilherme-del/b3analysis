@@ -83,6 +83,10 @@ FIIS = [
 BAZIN_MINIMA = 0.06   # Taxa minima de retorno para calculo do preco-teto (6% a.a.)
 CDI_ATUAL    = 0.1475  # Selic/CDI atual — benchmark de retorno minimo para renda variavel
 
+# Saida dos scans — relativa ao script, nao ao diretorio de onde foi invocado.
+# Ignorada pelo git (ver .gitignore): sao snapshots de mercado, nao codigo.
+SCANS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scans")
+
 
 # ── Helpers de dividendo ─────────────────────────────────────────────────────
 
@@ -454,7 +458,7 @@ def main() -> None:
     so_fiis  = "--so-fiis"  in sys.argv
 
     ts_pasta  = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    pasta     = f"scan_div_{ts_pasta}"
+    pasta     = os.path.join(SCANS_DIR, f"scan_div_{ts_pasta}")
     os.makedirs(pasta, exist_ok=True)
 
     acoes_resultados: list[dict] = []
@@ -521,9 +525,16 @@ def main() -> None:
     with open(rel_path, "w", encoding="utf-8") as f:
         f.write(relatorio + "\n")
 
-    print(f"\nResultados salvos em: {pasta}/")
-    print(f"  Relatorio: {rel_path}")
-    print(f"  JSON bruto: {json_path}")
+    def _exibir(caminho: str) -> str:
+        """Caminho relativo ao cwd quando possivel — absoluto polui a saida."""
+        try:
+            return os.path.relpath(caminho)
+        except ValueError:  # drives diferentes no Windows
+            return caminho
+
+    print(f"\nResultados salvos em: {_exibir(pasta)}{os.sep}")
+    print(f"  Relatorio:  {_exibir(rel_path)}")
+    print(f"  JSON bruto: {_exibir(json_path)}")
 
 
 if __name__ == "__main__":
