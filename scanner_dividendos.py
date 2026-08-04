@@ -96,38 +96,79 @@ def _normalizar_index(series: pd.Series) -> pd.Series:
     return series
 
 
-def _media_dividendo_5a(t: yf.Ticker) -> float:
+def _dividendos_por_ano(t: yf.Ticker) -> pd.Series:
     """
-    Retorna a media anual de dividendos pagos nos ultimos 5 anos (em R$ por cota/acao).
-    Usa o historico real de pagamentos — mais preciso que DY x preco do info dict.
+    Soma de dividendos por ano-calendario. Series vazia se nao houver historico.
+    Cacheado no proprio Ticker para evitar refetch entre as metricas.
     """
+    try:
+        hist = t.dividends
+        if hist is None or hist.empty:
+            return pd.Series(dtype=float)
+        hist = _normalizar_index(hist)
+        return hist.groupby(hist.index.year).sum()
+    except Exception:
+        return pd.Series(dtype=float)
+
+
+def _media_dividendo_5a(por_ano: pd.Series) -> float:
+    """
+    Media anual de dividendos dos ultimos 5 anos-calendario COMPLETOS.
+
+    O ano corrente e excluido de proposito: incluir um ano parcial puxa a media
+    para baixo e subestima o preco-teto (verificado: -30% em TAEE11, -22% em BBAS3).
+    """
+    if por_ano.empty:
+        return 0.0
+    ano_atual = pd.Timestamp.now().year
+    completos = por_ano[(por_ano.index >= ano_atual - 5) & (por_ano.index <= ano_atual - 1)]
+    return float(completos.mean()) if not completos.empty else 0.0
+
+
+def _anos_pagando(por_ano: pd.Series) -> int:
+    """Anos-calendario completos com pagamento de dividendo nos ultimos 10 anos."""
+    if por_ano.empty:
+        return 0
+    ano_atual = pd.Timestamp.now().year
+    janela = por_ano[
+        (por_ano.index >= ano_atual - 10) & (por_ano.index <= ano_atual - 1) & (por_ano > 0)
+    ]
+    return int(len(janela))
+
+
+def _dy_ttm(t: yf.Ticker, preco: float) -> float:
+    """
+    DY dos ultimos 12 meses, calculado do historico real de pagamentos.
+
+    Nao usa info['dividendYield']: verificado que o campo e inconsistente entre
+    tickers .SA (ITUB4 reportou 2.07 contra 8.16% real — erro de 4x).
+    """
+    if preco <= 0:
+        return 0.0
     try:
         hist = t.dividends
         if hist is None or hist.empty:
             return 0.0
         hist = _normalizar_index(hist)
-        cutoff = pd.Timestamp.now() - pd.DateOffset(years=5)
-        recent = hist[hist.index >= cutoff]
-        if recent.empty:
-            return 0.0
-        annual = recent.groupby(recent.index.year).sum()
-        return float(annual.mean())
+        ttm = float(hist[hist.index >= (pd.Timestamp.now() - pd.DateOffset(years=1))].sum())
+        return (ttm / preco) * 100
     except Exception:
         return 0.0
 
 
-def _anos_pagando(t: yf.Ticker) -> int:
-    """Quantos anos distintos a empresa pagou dividendo nos ultimos 10 anos."""
-    try:
-        hist = t.dividends
-        if hist is None or hist.empty:
-            return 0
-        hist = _normalizar_index(hist)
-        cutoff = pd.Timestamp.now() - pd.DateOffset(years=10)
-        recent = hist[hist.index >= cutoff]
-        return int(recent.index.year.nunique()) if not recent.empty else 0
-    except Exception:
-        return 0
+def _avaliar_qualidade(roe: float | None, payout: float | None, anos: int) -> list[str]:
+    """
+    Filtro de consistencia Barsi — aplicado ANTES do preco.
+    Retorna lista de flags; lista vazia = passou.
+    """
+    flags = []
+    if roe is not None and roe < 0:
+        flags.append("ROE<0")
+    if payout is not None and payout > 1.0:
+        flags.append("PAYOUT>100%")
+    if anos < 5:
+        flags.append(f"SO {anos}a")
+    return flags
 
 
 # ── Coleta por tipo de ativo ─────────────────────────────────────────────────
@@ -154,12 +195,15 @@ def fetch_acao(ticker_symbol: str, setor: str) -> dict:
             base["erro"] = "sem preco de mercado"
             return base
 
-        div_medio_5a = _media_dividendo_5a(t)
-        dy_atual_pct = (info.get("dividendYield") or 0.0) * 100
-        anos_div     = _anos_pagando(t)
+        por_ano      = _dividendos_por_ano(t)
+        div_medio_5a = _media_dividendo_5a(por_ano)
+        dy_ttm_pct   = _dy_ttm(t, preco)
+        anos_div     = _anos_pagando(por_ano)
 
-        preco_teto = (div_medio_5a / BAZIN_MINIMA) if div_medio_5a > 0 else None
-        margem_pct = ((preco_teto / preco - 1) * 100) if (preco_teto and preco > 0) else None
+        preco_teto  = (div_medio_5a / BAZIN_MINIMA) if div_medio_5a > 0 else None
+        teto_cdi    = (div_medio_5a / CDI_ATUAL)    if div_medio_5a > 0 else None
+        margem_pct  = ((preco_teto / preco - 1) * 100) if preco_teto else None
+        margem_cdi  = ((teto_cdi   / preco - 1) * 100) if teto_cdi   else None
 
         payout = info.get("payoutRatio")
         roe    = info.get("returnOnEquity")
@@ -169,13 +213,16 @@ def fetch_acao(ticker_symbol: str, setor: str) -> dict:
             "nome":          (info.get("longName") or info.get("shortName") or "")[:42],
             "preco":         round(preco, 2),
             "div_medio_5a":  round(div_medio_5a, 4),
-            "dy_atual_pct":  round(dy_atual_pct, 2),
+            "dy_ttm_pct":    round(dy_ttm_pct, 2),
             "preco_teto":    round(preco_teto, 2) if preco_teto else None,
             "margem_pct":    round(margem_pct, 1) if margem_pct is not None else None,
+            "teto_cdi":      round(teto_cdi, 2) if teto_cdi else None,
+            "margem_cdi":    round(margem_cdi, 1) if margem_cdi is not None else None,
             "anos_div":      anos_div,
-            "payout_pct":    round(payout * 100, 1) if payout else None,
-            "roe_pct":       round(roe * 100, 1) if roe else None,
+            "payout_pct":    round(payout * 100, 1) if payout is not None else None,
+            "roe_pct":       round(roe * 100, 1) if roe is not None else None,
             "p_vp":          round(pvp, 2) if pvp else None,
+            "flags":         _avaliar_qualidade(roe, payout, anos_div),
         })
     except Exception as e:
         base["erro"] = str(e)[:100]
@@ -204,23 +251,29 @@ def fetch_fii(ticker_symbol: str) -> dict:
             base["erro"] = "sem preco de mercado"
             return base
 
-        div_medio_5a = _media_dividendo_5a(t)
-        dy_atual_pct = (info.get("dividendYield") or 0.0) * 100
-        anos_div     = _anos_pagando(t)
+        por_ano      = _dividendos_por_ano(t)
+        div_medio_5a = _media_dividendo_5a(por_ano)
+        dy_ttm_pct   = _dy_ttm(t, preco)
+        anos_div     = _anos_pagando(por_ano)
         pvp          = info.get("priceToBook")
 
         preco_teto = (div_medio_5a / BAZIN_MINIMA) if div_medio_5a > 0 else None
-        margem_pct = ((preco_teto / preco - 1) * 100) if (preco_teto and preco > 0) else None
+        teto_cdi   = (div_medio_5a / CDI_ATUAL)    if div_medio_5a > 0 else None
+        margem_pct = ((preco_teto / preco - 1) * 100) if preco_teto else None
+        margem_cdi = ((teto_cdi   / preco - 1) * 100) if teto_cdi   else None
 
         base.update({
             "nome":         (info.get("longName") or info.get("shortName") or "")[:42],
             "preco":        round(preco, 2),
             "div_medio_5a": round(div_medio_5a, 4),
-            "dy_atual_pct": round(dy_atual_pct, 2),
+            "dy_ttm_pct":   round(dy_ttm_pct, 2),
             "preco_teto":   round(preco_teto, 2) if preco_teto else None,
             "margem_pct":   round(margem_pct, 1) if margem_pct is not None else None,
+            "teto_cdi":     round(teto_cdi, 2) if teto_cdi else None,
+            "margem_cdi":   round(margem_cdi, 1) if margem_cdi is not None else None,
             "anos_div":     anos_div,
             "p_vp":         round(pvp, 2) if pvp else None,
+            "flags":        _avaliar_qualidade(None, None, anos_div),
         })
     except Exception as e:
         base["erro"] = str(e)[:100]
@@ -229,15 +282,22 @@ def fetch_fii(ticker_symbol: str) -> dict:
 
 # ── Formatacao do relatorio ──────────────────────────────────────────────────
 
-def _status(margem: float | None) -> str:
+def _status(margem: float | None, flags: list[str] | None) -> str:
+    """
+    Filtro de qualidade vem ANTES do preco (criterio Barsi): um ativo com ROE
+    negativo, payout insustentavel ou historico curto e excluido independente
+    de quao barato esteja — barato com fundamento ruim e armadilha de valor.
+    """
+    if flags:
+        return "EXCLUIR"
     if margem is None:
         return "S/DADO"
     if margem >= 20:
         return "BARATO"
     if margem >= 0:
-        return "OK    "
+        return "OK"
     if margem >= -20:
-        return "CARO  "
+        return "CARO"
     return "MUITO CARO"
 
 
@@ -245,14 +305,16 @@ def _linha_acao(r: dict) -> str:
     preco_s  = f"R${r['preco']:>8.2f}"
     teto_s   = f"R${r['preco_teto']:>8.2f}" if r.get("preco_teto") else "       N/D"
     margem_s = f"{r['margem_pct']:>+7.1f}%" if r.get("margem_pct") is not None else "     N/D"
-    dy_s     = f"{r['dy_atual_pct']:>5.1f}%" if r.get("dy_atual_pct") else "  N/D"
+    mcdi_s   = f"{r['margem_cdi']:>+7.1f}%" if r.get("margem_cdi") is not None else "     N/D"
+    dy_s     = f"{r['dy_ttm_pct']:>5.1f}%" if r.get("dy_ttm_pct") else "   N/D"
     anos_s   = f"{r['anos_div']:>2}a" if r.get("anos_div") else " -"
-    roe_s    = f"{r['roe_pct']:>5.1f}%" if r.get("roe_pct") is not None else "   N/D"
-    pout_s   = f"{r['payout_pct']:>5.0f}%" if r.get("payout_pct") is not None else "   N/D"
-    st       = _status(r.get("margem_pct"))
+    roe_s    = f"{r['roe_pct']:>6.1f}%" if r.get("roe_pct") is not None else "    N/D"
+    pout_s   = f"{r['payout_pct']:>5.0f}%" if r.get("payout_pct") is not None else "  N/D"
+    st       = _status(r.get("margem_pct"), r.get("flags"))
+    obs      = (" " + ",".join(r["flags"])) if r.get("flags") else ""
     return (
-        f"  {r['ticker']:<9} {preco_s}  {teto_s}  {margem_s}  "
-        f"{dy_s}  {anos_s}  {roe_s}  {pout_s}  [{st}]"
+        f"  {r['ticker']:<9} {preco_s}  {dy_s}  {teto_s}  {margem_s}  {mcdi_s}  "
+        f"{anos_s}  {roe_s}  {pout_s}  {st:<11}{obs}"
     )
 
 
@@ -260,19 +322,29 @@ def _linha_fii(r: dict) -> str:
     preco_s  = f"R${r['preco']:>8.2f}"
     teto_s   = f"R${r['preco_teto']:>8.2f}" if r.get("preco_teto") else "       N/D"
     margem_s = f"{r['margem_pct']:>+7.1f}%" if r.get("margem_pct") is not None else "     N/D"
-    dy_s     = f"{r['dy_atual_pct']:>5.1f}%" if r.get("dy_atual_pct") else "  N/D"
+    mcdi_s   = f"{r['margem_cdi']:>+7.1f}%" if r.get("margem_cdi") is not None else "     N/D"
+    dy_s     = f"{r['dy_ttm_pct']:>5.1f}%" if r.get("dy_ttm_pct") else "   N/D"
     anos_s   = f"{r['anos_div']:>2}a" if r.get("anos_div") else " -"
-    pvp_s    = f"{r['p_vp']:>5.2f}" if r.get("p_vp") else "   N/D"
-    st       = _status(r.get("margem_pct"))
+    pvp_s    = f"{r['p_vp']:>5.2f}" if r.get("p_vp") else "  N/D"
+    st       = _status(r.get("margem_pct"), r.get("flags"))
+    obs      = (" " + ",".join(r["flags"])) if r.get("flags") else ""
     return (
-        f"  {r['ticker']:<10} {preco_s}  {teto_s}  {margem_s}  "
-        f"{dy_s}  {anos_s}  {pvp_s}  [{st}]"
+        f"  {r['ticker']:<9} {preco_s}  {dy_s}  {teto_s}  {margem_s}  {mcdi_s}  "
+        f"{anos_s}  {pvp_s}  {st:<11}{obs}"
+    )
+
+
+def _ordenar(registros: list[dict]) -> list[dict]:
+    """Reprovados no filtro de qualidade vao para o fim, independente da margem."""
+    return sorted(
+        registros,
+        key=lambda r: (bool(r.get("flags")), -(r.get("margem_pct") if r.get("margem_pct") is not None else -9999)),
     )
 
 
 def formatar_relatorio(acoes: list[dict], fiis: list[dict]) -> str:
     ts = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-    W  = 82
+    W  = 108
     linhas = []
 
     linhas.append("=" * W)
@@ -293,7 +365,7 @@ def formatar_relatorio(acoes: list[dict], fiis: list[dict]) -> str:
     # ── Acoes por setor ──────────────────────────────────────────────────────
     if acoes:
         linhas.append("─" * W)
-        linhas.append("  ACOES — B.E.S.T. (Barsi)  |  Preco-teto = div.medio_5a / 6%")
+        linhas.append("  ACOES — B.E.S.T. (Barsi)  |  filtro de qualidade aplicado ANTES do preco")
         linhas.append("─" * W)
 
         por_setor: dict[str, list] = {}
@@ -305,14 +377,13 @@ def formatar_relatorio(acoes: list[dict], fiis: list[dict]) -> str:
                 por_setor.setdefault(r["setor"], []).append(r)
 
         for setor, registros in por_setor.items():
-            registros.sort(key=lambda r: r.get("margem_pct") or -9999, reverse=True)
             linhas.append(f"\n  [{setor}]")
             linhas.append(
-                f"  {'TICKER':<9} {'PRECO':>10}  {'PRECO-TETO':>10}  {'MARGEM':>8}  "
-                f"{'DY%':>5}  {'DIV':>3}  {'ROE%':>6}  {'POUT%':>6}  STATUS"
+                f"  {'TICKER':<9} {'PRECO':>10}  {'DY':>6}  {'TETO 6%':>10}  {'MARG 6%':>8}  "
+                f"{'MARG CDI':>8}  {'DIV':>3}  {'ROE':>7}  {'POUT':>6}  STATUS"
             )
             linhas.append("  " + "-" * (W - 2))
-            for r in registros:
+            for r in _ordenar(registros):
                 linhas.append(_linha_acao(r))
 
         if erros_acao:
@@ -325,19 +396,18 @@ def formatar_relatorio(acoes: list[dict], fiis: list[dict]) -> str:
     # ── FIIs ─────────────────────────────────────────────────────────────────
     if fiis:
         linhas.append("─" * W)
-        linhas.append("  FIIs — DY + P/VP + Preco-teto Bazin (div.medio_5a / 6%)")
+        linhas.append("  FIIs — DY real (TTM) + P/VP + teto Bazin 6% vs teto CDI")
         linhas.append("─" * W)
 
         fiis_ok  = [r for r in fiis if not r.get("erro")]
         fiis_err = [r for r in fiis if r.get("erro")]
-        fiis_ok.sort(key=lambda r: r.get("margem_pct") or -9999, reverse=True)
 
         linhas.append(
-            f"\n  {'TICKER':<10} {'PRECO':>10}  {'PRECO-TETO':>10}  {'MARGEM':>8}  "
-            f"{'DY%':>5}  {'DIV':>3}  {'P/VP':>6}  STATUS"
+            f"\n  {'TICKER':<9} {'PRECO':>10}  {'DY':>6}  {'TETO 6%':>10}  {'MARG 6%':>8}  "
+            f"{'MARG CDI':>8}  {'DIV':>3}  {'P/VP':>6}  STATUS"
         )
         linhas.append("  " + "-" * (W - 2))
-        for r in fiis_ok:
+        for r in _ordenar(fiis_ok):
             linhas.append(_linha_fii(r))
 
         if fiis_err:
@@ -350,16 +420,28 @@ def formatar_relatorio(acoes: list[dict], fiis: list[dict]) -> str:
     # ── Legenda ──────────────────────────────────────────────────────────────
     linhas.append("─" * W)
     linhas.append("  Legenda:")
-    linhas.append("  BARATO     — preco < preco-teto (margem > 20%) — zona de compra")
-    linhas.append("  OK         — proximo ao teto   (0% a +20%)     — aguardar queda")
-    linhas.append("  CARO       — acima do teto     (0% a -20%)     — nao iniciar posicao")
-    linhas.append("  MUITO CARO — muito acima        (< -20%)        — evitar")
+    linhas.append("  EXCLUIR    — reprovado no filtro de qualidade (ver flag ao lado) — nao comprar")
+    linhas.append("  BARATO     — margem > +20% sobre o teto de 6% — zona de compra")
+    linhas.append("  OK         — margem 0% a +20% — proximo do teto, aguardar queda")
+    linhas.append("  CARO       — margem 0% a -20% — nao iniciar posicao")
+    linhas.append("  MUITO CARO — margem < -20% — evitar")
     linhas.append("  S/DADO     — sem historico de dividendos disponivel no yfinance")
     linhas.append("")
-    linhas.append("  Preco-teto Bazin  = dividendo_medio_anual_5a / 0,06")
-    linhas.append("  Margem            = (preco_teto / preco_atual - 1) x 100")
-    linhas.append("  DIV               = anos distintos pagando dividendo (ultimos 10a)")
-    linhas.append("  P/VP              = preco / valor patrimonial por cota")
+    linhas.append("  Flags de qualidade (eliminatorias, aplicadas antes do preco):")
+    linhas.append("    ROE<0        — prejuizo no patrimonio, nao sustenta dividendo")
+    linhas.append("    PAYOUT>100%  — distribui mais do que lucra, insustentavel")
+    linhas.append("    SO Na        — historico de dividendos menor que 5 anos completos")
+    linhas.append("")
+    linhas.append("  DY        = dividendos dos ultimos 12 meses / preco atual (calculado do")
+    linhas.append("              historico real — o campo dividendYield do yfinance e inconsistente)")
+    linhas.append("  TETO 6%   = dividendo medio dos ultimos 5 anos COMPLETOS / 0,06  (Bazin classico)")
+    linhas.append("  MARG 6%   = (teto 6% / preco - 1) x 100")
+    linhas.append(f"  MARG CDI  = mesma conta usando {CDI_ATUAL*100:.2f}% (Selic) como taxa minima.")
+    linhas.append("              Se MARG CDI for negativa, o ativo rende menos que a renda fixa hoje.")
+    linhas.append("  DIV       = anos-calendario completos com dividendo (ultimos 10a)")
+    linhas.append("  P/VP      = preco / valor patrimonial por cota")
+    linhas.append("")
+    linhas.append("  Nota: o ano corrente e excluido da media — ano parcial subestima o teto.")
     linhas.append("─" * W)
 
     return "\n".join(linhas)
@@ -390,11 +472,12 @@ def main() -> None:
                 if r.get("erro"):
                     print(f"ERRO: {r['erro']}")
                 elif r.get("preco_teto"):
-                    m = r["margem_pct"]
+                    m     = r["margem_pct"]
                     m_str = f"{m:+.1f}%" if m is not None else "N/D"
+                    flag  = f"  <<{','.join(r['flags'])}>>" if r.get("flags") else ""
                     print(
-                        f"R${r['preco']:.2f} | teto R${r['preco_teto']:.2f} | "
-                        f"margem {m_str} | DY {r['dy_atual_pct']:.1f}%"
+                        f"R${r['preco']:.2f} | DY {r['dy_ttm_pct']:.2f}% | "
+                        f"teto R${r['preco_teto']:.2f} | margem {m_str}{flag}"
                     )
                 else:
                     print(f"R${r['preco']:.2f} | sem historico de div para calcular teto")
@@ -410,12 +493,13 @@ def main() -> None:
             if r.get("erro"):
                 print(f"ERRO: {r['erro']}")
             elif r.get("preco_teto"):
-                m = r["margem_pct"]
-                m_str = f"{m:+.1f}%" if m is not None else "N/D"
-                pvp_str = f"P/VP {r['p_vp']:.2f}" if r.get("p_vp") else ""
+                m       = r["margem_pct"]
+                m_str   = f"{m:+.1f}%" if m is not None else "N/D"
+                pvp_str = f" | P/VP {r['p_vp']:.2f}" if r.get("p_vp") else ""
+                flag    = f"  <<{','.join(r['flags'])}>>" if r.get("flags") else ""
                 print(
-                    f"R${r['preco']:.2f} | teto R${r['preco_teto']:.2f} | "
-                    f"margem {m_str} | DY {r['dy_atual_pct']:.1f}% {pvp_str}"
+                    f"R${r['preco']:.2f} | DY {r['dy_ttm_pct']:.2f}% | "
+                    f"teto R${r['preco_teto']:.2f} | margem {m_str}{pvp_str}{flag}"
                 )
             else:
                 print(f"R${r['preco']:.2f} | sem historico de div para calcular teto")
