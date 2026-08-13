@@ -242,6 +242,37 @@ def _media_dividendo_5a(por_ano: pd.Series) -> float:
     return float(completos.mean())
 
 
+def _gap_interior(por_ano: pd.Series) -> bool:
+    """
+    True quando ha ano sem provento ENTRE anos com provento, na janela dos 5
+    anos completos.
+
+    Interrupcao real aparece no FIM da serie: a empresa parou de pagar e nao
+    voltou. Buraco no MEIO, com pagamento antes e depois, quase sempre e falha
+    da base — o yfinance perde a data-com de companhias que declaram dividendo
+    unico na AGO e parcelam o caixa ao longo do ano.
+
+    Foi exatamente o caso da CPFE3: faltam 2024 (R$2,7539) e 2025 (R$2,7942) na
+    base, o que derrubou a media de 5 anos de R$3,0755 para R$1,9659 e inverteu
+    a margem de +18,9% para -24,0%. O zero-fill e correto para quem interrompeu
+    de verdade e traicoeiro quando a lacuna e da fonte — dai a flag, que sinaliza
+    para conferir em vez de confiar no numero.
+    """
+    if por_ano.empty:
+        return False
+    ano_atual = pd.Timestamp.now().year
+    # A janela inclui o ano CORRENTE de proposito. O que torna um zero suspeito
+    # nao e a posicao dele nos 5 anos completos, e sim existir pagamento DEPOIS
+    # dele: quem voltou a pagar nao havia interrompido. Na CPFE3 os zeros de
+    # 2024-2025 sao os dois ultimos anos completos — so o pagamento de 2026 os
+    # denuncia como lacuna de base em vez de interrupcao real.
+    janela = por_ano.reindex(range(ano_atual - 5, ano_atual + 1), fill_value=0.0)
+    pagos = [ano for ano, v in janela.items() if v > 0]
+    if len(pagos) < 2:
+        return False
+    return any(janela.get(ano, 0.0) <= 0 for ano in range(min(pagos), max(pagos)))
+
+
 def _anos_pagando(por_ano: pd.Series) -> int:
     """Anos-calendario completos com pagamento de dividendo nos ultimos 10 anos."""
     if por_ano.empty:
@@ -283,7 +314,7 @@ def _pvp_justificado(roe: float | None) -> float | None:
 
 def _avaliar_qualidade(
     roe: float | None, payout: float | None, anos: int, pagou_ultimo_ano: bool = True,
-    frac_extra: float = 0.0, em_queda: bool = False,
+    frac_extra: float = 0.0, em_queda: bool = False, gap_interior: bool = False,
 ) -> list[str]:
     """
     Filtro de consistencia Barsi — aplicado ANTES do preco.
@@ -307,6 +338,10 @@ def _avaliar_qualidade(
         flags.append(f"EXTRAORD {frac_extra*100:.0f}%")
     if em_queda:
         flags.append("DIV EM QUEDA")
+    # Nao e reprovacao: e aviso de que o teto pode estar deflacionado por lacuna
+    # da fonte. Conferir o historico de proventos antes de descartar o ativo.
+    if gap_interior:
+        flags.append("DADO SUSPEITO")
     return flags
 
 
@@ -405,8 +440,10 @@ def fetch_ativo(ticker_symbol: str, setor: str, is_fii: bool = False) -> dict:
             "frac_extra":   round(frac_extra, 3),
             "div_ttm":      round(div_ttm, 4),
             "div_em_queda": em_queda,
+            "gap_interior": _gap_interior(por_ano),
             "flags":        _avaliar_qualidade(roe, payout, anos_div, pagou_ult_ano,
-                                               frac_extra, em_queda),
+                                               frac_extra, em_queda,
+                                               _gap_interior(por_ano)),
         })
     except Exception as e:
         base["erro"] = str(e)[:100]
@@ -639,6 +676,10 @@ def formatar_relatorio(acoes: list[dict], fiis: list[dict]) -> str:
     linhas.append("                   capital, nao renda: GRND3 pagou R$979,9 mi de uma vez em")
     linhas.append("                   12/2025 consumindo o caixa que gerava metade do seu lucro,")
     linhas.append("                   e apareceu com DY de 44,8% e margem de +353,9%.")
+    linhas.append("    DADO SUSPEITO — ha ano sem provento ENTRE anos com provento. Interrupcao real")
+    linhas.append("                   aparece no fim da serie; buraco no meio costuma ser lacuna da")
+    linhas.append("                   base. CPFE3 perdeu 2024 e 2025 no yfinance e a margem caiu de")
+    linhas.append("                   +18,9% para -24,0%. CONFERIR o historico antes de descartar.")
     linhas.append("    DIV EM QUEDA — media de 5a > 1,5x o pago nos ultimos 12m. A empresa mudou")
     linhas.append("                   de politica e o teto olha para um passado que nao volta.")
     linhas.append("                   PETR3: R$16,77/acao em 2022 contra R$3,28 em 2025.")
