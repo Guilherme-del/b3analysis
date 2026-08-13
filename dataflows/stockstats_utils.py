@@ -100,7 +100,16 @@ class StockstatsUtils:
         matching_rows = df[df["Date"].str.startswith(curr_date_str)]
 
         if not matching_rows.empty:
-            indicator_value = matching_rows[indicator].values[0]
-            return indicator_value
-        else:
-            return "N/A: Not a trading day (weekend or holiday)"
+            return matching_rows[indicator].values[0]
+
+        # Nao houve pregao nessa data — fim de semana, feriado, ou o pregao de
+        # hoje ainda nao fechou. Devolver a string "N/A" entregava texto onde o
+        # chamador espera numero, e justamente na data que mais importa: a de
+        # hoje. Cai para o ultimo pregao <= curr_date, que e o que "na data X"
+        # significa na pratica. Date esta em ISO (YYYY-MM-DD), entao a
+        # comparacao lexicografica de string ja ordena cronologicamente.
+        previous = df[df["Date"] <= curr_date_str]
+        if not previous.empty:
+            return previous[indicator].values[-1]
+
+        return "N/A: No trading data on or before this date"

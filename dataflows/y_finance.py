@@ -116,6 +116,12 @@ def get_stock_stats_indicators_window(
             "Usage: Set stop-loss levels and adjust position sizes based on current market volatility. "
             "Tips: It's a reactive measure, so use it as part of a broader risk management strategy."
         ),
+        "adx": (
+            "ADX: Average Directional Index measures trend strength, not direction. "
+            "Usage: Above 25 confirms a real trend worth following; below 20 signals a ranging market where "
+            "trend-following signals from MACD or moving averages are unreliable. "
+            "Tips: Always pair with a directional indicator — ADX rising during a downtrend means the downtrend is strengthening."
+        ),
         # Volume-Based Indicators
         "vwma": (
             "VWMA: A moving average weighted by volume. "
