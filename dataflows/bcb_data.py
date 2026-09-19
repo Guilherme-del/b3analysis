@@ -9,8 +9,8 @@ from typing import Optional
 _BCB_BASE_URL = "https://api.bcb.gov.br/dados/serie/bcdata.sgs.{code}/dados"
 
 _SERIES = {
-    "selic_diaria": 432,
-    "selic_meta": 1178,
+    "selic_diaria": 1178,
+    "selic_meta": 432,
     "cdi": 4391,
     "ipca": 433,
     "igpm": 189,
@@ -44,6 +44,14 @@ def _fetch_series(code: int, n_last: int = 10) -> list[dict]:
     except Exception as e:
         print(f"[BCB] Aviso: falha ao buscar série {code}: {e}", file=sys.stderr)
         return []
+
+
+def _sorted_by_date(rows: list[dict]) -> list[dict]:
+    """Sort BCB rows chronologically; the API ordering varies between series."""
+    try:
+        return sorted(rows, key=lambda d: datetime.strptime(d["data"], "%d/%m/%Y"))
+    except (KeyError, ValueError):
+        return rows
 
 
 def _fetch_series_range(code: int, start_date: str, end_date: str) -> list[dict]:
@@ -85,7 +93,7 @@ def get_bcb_macro_indicators(
     sections.append(f"## Indicadores Macroeconômicos Brasileiros (BCB)\n")
     sections.append(f"Período: {start_date} a {curr_date}\n")
 
-    selic = _fetch_series(_SERIES["selic_diaria"], n_last=5)
+    selic = _sorted_by_date(_fetch_series(_SERIES["selic_diaria"], n_last=5))
     if selic:
         latest = selic[-1]
         sections.append(f"### Taxa Selic Over\n")
@@ -93,13 +101,18 @@ def get_bcb_macro_indicators(
         rows = " | ".join([f"{d['data']}: {d['valor']}%" for d in selic])
         sections.append(f"Histórico recente: {rows}\n")
 
-    selic_meta = _fetch_series(_SERIES["selic_meta"], n_last=3)
+    selic_meta = _sorted_by_date(_fetch_series(_SERIES["selic_meta"], n_last=3))
     if selic_meta:
         latest = selic_meta[-1]
         sections.append(f"\n### Meta Selic (Copom)\n")
         sections.append(f"Último valor: **{latest['valor']}% a.a.** (data: {latest['data']})\n")
 
-    cdi = _fetch_series(_SERIES["cdi"], n_last=5)
+    cdi = _sorted_by_date(_fetch_series(_SERIES["cdi"], n_last=5))
+    # Series 4391 accumulates the CDI within each month, so the current month is
+    # still partial; annualizing it understates the rate badly. Use the last
+    # month that has already closed.
+    ref_month = datetime.strptime(curr_date, "%Y-%m-%d").strftime("%m/%Y")
+    cdi = [d for d in cdi if not d["data"].endswith(ref_month)] or cdi
     if cdi:
         latest = cdi[-1]
         try:
@@ -190,6 +203,10 @@ def get_bcb_selic_history(
 
     if not meta_data:
         return "Dados da Selic indisponíveis no momento."
+
+    # The BCB API returns this series newest-first. Sort chronologically so that
+    # "first" is the oldest reading and the trend arrow reads oldest -> newest.
+    meta_data = _sorted_by_date(meta_data)
 
     lines = [f"## Histórico da Meta Selic (Copom) — últimos {look_back_days} dias\n\n"]
     for d in meta_data:

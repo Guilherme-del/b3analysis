@@ -101,7 +101,7 @@ Criteria 1, 2, and 3 are **eliminatory** — fail any one = automatic AVOID, no 
 | 4 | Novo Mercado listing | Partial |
 | 5 | Tag Along 100% | Partial |
 | 6 | Controlled debt (net cash or D/EBITDA < 2x) | Partial |
-| 7 | Expected return > CDI (~14.75% a.a.) | Partial |
+| 7 | Expected return > CDI (see Macro context) | Partial |
 
 Score 6–7 = Strong Buy. Score ≤ 2 = Exclude from portfolio entirely.
 </important>
@@ -110,9 +110,30 @@ Red flags: ticker 4/11 with no ON liquidity · controlling shareholder only in O
 
 ## Macro context
 
-- **Selic meta**: ~14,75% a.a. (tightening cycle, 2025–2026)
-- **CDI** ≈ Selic − 0.10% a.a. — minimum return benchmark for equities
-- High Selic: favors insurance and exporters; hurts retail, utilities, high-growth tech
+<important>
+Re-fetch this with `/b3:macro` before any analysis — these figures move and a stale
+cycle direction inverts every sector conclusion downstream.
+</important>
+
+Last verified 2026-09-18:
+
+- **Selic meta** (Copom target, BCB series 432): 13,75% a.a. — **easing cycle**,
+  5th consecutive cut (2026-09-16). The target series extends forward to the next
+  Copom meeting, so a future date on it is expected, not an error
+- **Selic Over** (realized rate, series 1178): 13,65% — runs ~10bp below the target
+- **CDI** ≈ Selic Over ≈ 13,65% gross
+- **CDI net of tax** ≈ 11,60% (15% income tax above 720 days). Dividends and FII income
+  are tax-exempt for individuals, so criterion 7 must compare exempt yields against the
+  **net** CDI, not the gross rate
+- **IPCA**: deflation — −0.32% (Aug/2026), −0.09% over 3 months. IGP-M also negative
+- **BRL/USD**: ~5,15 | Election year
+
+Sector impact in an **easing** cycle (inverts the tightening-cycle rules):
+- Favors: leveraged utilities, telecom (bond proxies), FIIs (longest duration), real estate
+- Hurts: insurers (float earns less — the opposite of a tightening cycle), banks (spread compression)
+- **Catch:** negative IPCA/IGP-M freeze inflation-indexed revenue (sanitation tariffs,
+  distribution Parcela B, PPAs, shopping/logistics rents). The same companies that gain on
+  the financial line lose on the operating line
 
 ## Report language
 
